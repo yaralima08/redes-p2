@@ -21,7 +21,13 @@ def dados_recebidos(conexao, dados):
 def conexao_aceita(conexao):
     conexao.registrar_recebedor(dados_recebidos)   # usa esse mesmo recebedor para toda conexão aceita
 
-rede = IP()
-servidor = Servidor(rede, 7000)
-servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
-asyncio.get_event_loop().run_forever()
+async def main():
+    rede = IP()
+    servidor = Servidor(rede, 7000)
+    servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+
+    await asyncio.Event().wait()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
