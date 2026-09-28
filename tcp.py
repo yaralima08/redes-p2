@@ -1,5 +1,6 @@
 import asyncio
-import random      
+import random   
+import time        
 from tcputils import *
 
 
@@ -27,7 +28,7 @@ class Servidor:
         payload = segment[4*(flags>>12):]
         id_conexao = (src_addr, src_port, dst_addr, dst_port)
 
-        #PASSO 1Handshake TCP (SYN handling)
+        #PASSO 1 Handshake TCP (Abertura de conexão com SYN)
         if (flags & FLAGS_SYN) == FLAGS_SYN:
             seq_no_servidor = random.randint(0, 0xFFFF)
             conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no_servidor, seq_no + 1)
@@ -55,19 +56,23 @@ class Conexao:
         self.seq_no = seq_no + 1  
         self.ack_no = ack_no     
 
-        #PASSO 5  Estado para temporizador e retransmissões
+        #PASSO 5 Estruturas de controle do timer e fila de envio
         self.pacotes_nao_confirmados = [] 
         self.timer = None
         self.timeout_interval = 0.5  
 
+        #PASSO 6 Variáveis para estimativa dinâmica do RTT e Timeout
+        self.estimated_rtt = None
+        self.dev_rtt = None
+
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
-        #PASSO 5 Processar confirmações (ACKs) recebidas
+        #PASSO 5 e 6 Processar ACKs recebidos e recalcular RTT/Timeout
         if flags & FLAGS_ACK:
             self._processar_ack(ack_no)
 
-        #PASSO 4 Tratar solicitação de encerramento do cliente 
+        #PASSO 4 Tratar solicitação de encerramento do cliente (FIN)
         if flags & FLAGS_FIN:
             self.ack_no = seq_no + 1
             
@@ -96,7 +101,7 @@ class Conexao:
     def registrar_recebedor(self, callback):
         self.callback = callback
 
-    #PASSO 3 + PASSO 5 Envio de dados com buffer de retransmissão
+    #PASSO 3, 5 e 6 Envio de dados com marcação de tempo para o RTT
     def enviar(self, dados):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
@@ -107,10 +112,15 @@ class Conexao:
 
             self.servidor.rede.enviar(segmento, src_addr)
 
-            self.pacotes_nao_confirmados.append((self.seq_no, segmento, len(payload)))
+            #PASSO 6 Guarda timestamp de envio e flag de retransmissão (False)
+            tempo_envio = time.time()
+            retransmitido = False
+
+            self.pacotes_nao_confirmados.append(
+                [self.seq_no, segmento, len(payload), tempo_envio, retransmitido]
+            )
             self.seq_no += len(payload)
 
-            #PASSO 5 Inicia o temporizador se ele não estiver rodando
             if self.timer is None:
                 self._iniciar_timer()
 
@@ -129,25 +139,44 @@ class Conexao:
     def _timeout(self):
         self.timer = None
         if self.pacotes_nao_confirmados:
-            # Retransmite o pacote mais antigo ainda não confirmado
-            _, segmento, _ = self.pacotes_nao_confirmados[0]
+            # [PASSO 6] Marca o pacote como retransmitido (para ignorar no RTT)
+            self.pacotes_nao_confirmados[0][4] = True
+            
+            segmento = self.pacotes_nao_confirmados[0][1]
             src_addr = self.id_conexao[0]
             self.servidor.rede.enviar(segmento, src_addr)
             
-            # Reinicia o temporizador para a retransmissão
             self._iniciar_timer()
 
+    #PASSO 6 Atualização do RTT e Timeout dinâmico
+    def _atualizar_rtt(self, sample_rtt):
+        if self.estimated_rtt is None:
+            self.estimated_rtt = sample_rtt
+            self.dev_rtt = sample_rtt / 2
+        else:
+            alpha = 0.125
+            beta = 0.25
+            self.estimated_rtt = (1 - alpha) * self.estimated_rtt + alpha * sample_rtt
+            self.dev_rtt = (1 - beta) * self.dev_rtt + beta * abs(sample_rtt - self.estimated_rtt)
+
+        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
+
     def _processar_ack(self, ack_no):
-        # Remove da lista de pendentes todos os pacotes totalmente confirmados pelo ack_no
+        tempo_atual = time.time()
         pacotes_restantes = []
-        for seq, segmento, tamanho in self.pacotes_nao_confirmados:
+
+        for item in self.pacotes_nao_confirmados:
+            seq, segmento, tamanho, tempo_envio, retransmitido = item
             if seq + tamanho <= ack_no:
-                continue  # Pacote foi confirmado
-            pacotes_restantes.append((seq, segmento, tamanho))
+                #PASSO 6 Se o pacote NÃO foi retransmitido, calcula o SampleRTT
+                if not retransmitido:
+                    sample_rtt = tempo_atual - tempo_envio
+                    self._atualizar_rtt(sample_rtt)
+            else:
+                pacotes_restantes.append(item)
 
         self.pacotes_nao_confirmados = pacotes_restantes
 
-        # Reinicia ou para o temporizador dependendo do estado do buffer
         if self.pacotes_nao_confirmados:
             self._iniciar_timer()
         else:
