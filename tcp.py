@@ -71,6 +71,7 @@ class Conexao:
         self.nao_confirmados = []                 # segmentos enviados e sem ACK
         self.fin_enviado = False
         self.fechar_pendente = False
+        self.fechando = False   # True assim que fechar() é chamado (Passo 4)
 
         # Passo 5: timer
         self.timer = None
@@ -105,6 +106,11 @@ class Conexao:
         # ---- Passos 5, 6 e 7: trata ACKs recebidos ----
         if flags & FLAGS_ACK:
             self._processar_ack(ack_no)
+
+        # ---- Passo 4: depois que fechar() foi chamado do nosso lado, não
+        # processamos/entregamos mais nenhum dado que chegar do cliente ----
+        if self.fechando:
+            return
 
         # ---- Passo 2: só aceita segmentos em ordem (descarta duplicados/fora de ordem) ----
         if seq_no != self.ack_no:
@@ -239,6 +245,7 @@ class Conexao:
     def fechar(self):
         if self.fin_enviado or self.fechar_pendente:
             return
+        self.fechando = True
         if self.fila_envio:
             self.fechar_pendente = True           # espera os dados enfileirados saírem
         else:
