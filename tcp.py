@@ -139,14 +139,16 @@ class Conexao:
     def _timeout(self):
         self.timer = None
         if self.pacotes_nao_confirmados:
+
             # PASSO 7: Redução multiplicativa
             self.cwnd = max(1, int(self.cwnd / 2))
+            
             # PASSO 6: Marca o pacote como retransmitido
             self.pacotes_nao_confirmados[0][4] = True
             segmento = self.pacotes_nao_confirmados[0][1]
             src_addr = self.id_conexao[0]
             self.servidor.rede.enviar(segmento, src_addr)
-            # Backoff exponencial para evitar múltiplas retransmissões em rajada
+            
             self.timeout_interval = min(self.timeout_interval * 2, 60.0)
             self._iniciar_timer()
 
@@ -173,6 +175,7 @@ class Conexao:
             if seq + tamanho <= ack_no:
                 confirmou_algo = True
                 pacotes_confirmados += 1
+
                 # PASSO 6: Se o pacote NÃO foi retransmitido, calcula o SampleRTT
                 if not retransmitido:
                     sample_rtt = tempo_atual - tempo_envio
@@ -183,10 +186,10 @@ class Conexao:
         self.pacotes_nao_confirmados = pacotes_restantes
 
         if confirmou_algo:
+
             # PASSO 7: AIMD - incrementa cwnd PRIMEIRO
             if pacotes_confirmados >= self.cwnd:
                 self.cwnd += 1
-            # DEPOIS define o timeout_interval com base no cwnd atualizado
             if self.cwnd >= 5:
                 self.timeout_interval = 0.1
             else:
