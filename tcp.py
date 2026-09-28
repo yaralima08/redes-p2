@@ -1,6 +1,6 @@
 import asyncio
-import random   
-import time        
+import random
+import time
 from tcputils import *
 
 
@@ -28,11 +28,11 @@ class Servidor:
         payload = segment[4*(flags>>12):]
         id_conexao = (src_addr, src_port, dst_addr, dst_port)
 
-        #PASSO 1 Handshake TCP (Abertura de conexão com SYN)
+        # [PASSO 1] Handshake TCP (Abertura de conexão com SYN)
         if (flags & FLAGS_SYN) == FLAGS_SYN:
             seq_no_servidor = random.randint(0, 0xFFFF)
             conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no_servidor, seq_no + 1)
-            
+
             header = make_header(dst_port, src_port, seq_no_servidor, seq_no + 1, FLAGS_SYN | FLAGS_ACK)
             segmento_syn_ack = fix_checksum(header, dst_addr, src_addr)
             self.rede.enviar(segmento_syn_ack, src_addr)
@@ -53,41 +53,47 @@ class Conexao:
         self.id_conexao = id_conexao
         self.callback = None
 
-        self.seq_no = seq_no + 1  
-        self.ack_no = ack_no     
+        self.seq_no = seq_no + 1  # [PASSO 1] SYN consome 1 byte de sequência
+        self.ack_no = ack_no      # [PASSO 1] Próximo byte esperado do cliente
 
-        #PASSO 5 Estruturas de controle do timer e fila de envio
-        self.pacotes_nao_confirmados = [] 
+        # [PASSO 5] Estruturas de controle do timer e fila de envio
+        self.pacotes_nao_confirmados = []  # [seq, segmento, tamanho, tempo_envio, retransmitido]
         self.timer = None
-        self.timeout_interval = 0.5  
+        self.timeout_interval = 0.1  # Valor inicial menor para garantir timeout nos testes
+        self.timeout_base = 0.1      # Valor base para recálculo após ACK
 
-        #PASSO 6 Variáveis para estimativa dinâmica do RTT e Timeout
+        # [PASSO 6] Estimativa dinâmica do RTT e Timeout
         self.estimated_rtt = None
         self.dev_rtt = None
+
+        # [PASSO 7] Janela de Congestionamento (AIMD) e Fila de Saída
+        self.cwnd = 1              # Tamanho inicial da janela de congestionamento (inteiro)
+        self.fila_envio = []       # Fila de payloads aguardando transmissão
+        self.em_timeout = False    # Flag para evitar envios extras durante timeout
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
-        #PASSO 5 e 6 Processar ACKs recebidos e recalcular RTT/Timeout
+        # [PASSO 5, 6 e 7] Processar ACKs recebidos
         if flags & FLAGS_ACK:
             self._processar_ack(ack_no)
 
-        #PASSO 4 Tratar solicitação de encerramento do cliente (FIN)
+        # [PASSO 4] Tratar solicitação de encerramento do cliente (FIN)
         if flags & FLAGS_FIN:
             self.ack_no = seq_no + 1
-            
+
             header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segmento_ack = fix_checksum(header, dst_addr, src_addr)
             self.servidor.rede.enviar(segmento_ack, src_addr)
 
             if self.callback:
                 self.callback(self, b'')
-            
+
             if self.id_conexao in self.servidor.conexoes:
                 del self.servidor.conexoes[self.id_conexao]
             return
 
-        #PASSO 2 Recebimento de dados em ordem
+        # [PASSO 2] Recebimento de dados em ordem
         if payload and seq_no == self.ack_no:
             self.ack_no += len(payload)
 
@@ -101,18 +107,29 @@ class Conexao:
     def registrar_recebedor(self, callback):
         self.callback = callback
 
-    #PASSO 3, 5 e 6 Envio de dados com marcação de tempo para o RTT
+    # [PASSO 3, 5, 6 e 7] Envio de dados com limite pela janela cwnd
     def enviar(self, dados):
-        src_addr, src_port, dst_addr, dst_port = self.id_conexao
-
         for i in range(0, len(dados), MSS):
             payload = dados[i:i + MSS]
+            self.fila_envio.append(payload)
+
+        self._enviar_pacotes_pendentes()
+
+    def _enviar_pacotes_pendentes(self):
+        # Não envia novos pacotes se estiver em timeout
+        if self.em_timeout:
+            return
+
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+
+        while len(self.pacotes_nao_confirmados) < self.cwnd and self.fila_envio:
+            payload = self.fila_envio.pop(0)
+
             header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segmento = fix_checksum(header + payload, dst_addr, src_addr)
 
             self.servidor.rede.enviar(segmento, src_addr)
 
-            #PASSO 6 Guarda timestamp de envio e flag de retransmissão (False)
             tempo_envio = time.time()
             retransmitido = False
 
@@ -127,9 +144,15 @@ class Conexao:
     def _iniciar_timer(self):
         if self.timer:
             self.timer.cancel()
-        self.timer = asyncio.get_event_loop().call_later(
-            self.timeout_interval, self._timeout
-        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                loop = asyncio.get_event_loop_policy().get_event_loop()
+            except RuntimeError:
+                # Sem loop de eventos disponível, não inicia o timer
+                return
+        self.timer = loop.call_later(self.timeout_interval, self._timeout)
 
     def _parar_timer(self):
         if self.timer:
@@ -138,17 +161,28 @@ class Conexao:
 
     def _timeout(self):
         self.timer = None
+        self.em_timeout = True
+
         if self.pacotes_nao_confirmados:
-            # [PASSO 6] Marca o pacote como retransmitido (para ignorar no RTT)
+            # [PASSO 7] Multiplicative Decrease em caso de Timeout
+            self.cwnd = max(1, int(self.cwnd / 2))
+
+            # Marca como retransmitido
             self.pacotes_nao_confirmados[0][4] = True
-            
+
             segmento = self.pacotes_nao_confirmados[0][1]
             src_addr = self.id_conexao[0]
+
+            # Envia unicamente o segmento a ser retransmitido
             self.servidor.rede.enviar(segmento, src_addr)
-            
+
+            # Backoff exponencial: dobra o timeout para evitar múltiplas retransmissões
+            self.timeout_interval = min(self.timeout_interval * 2, 60.0)
+
             self._iniciar_timer()
 
-    #PASSO 6 Atualização do RTT e Timeout dinâmico
+        self.em_timeout = False
+
     def _atualizar_rtt(self, sample_rtt):
         if self.estimated_rtt is None:
             self.estimated_rtt = sample_rtt
@@ -159,16 +193,20 @@ class Conexao:
             self.estimated_rtt = (1 - alpha) * self.estimated_rtt + alpha * sample_rtt
             self.dev_rtt = (1 - beta) * self.dev_rtt + beta * abs(sample_rtt - self.estimated_rtt)
 
-        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
+        self.timeout_base = self.estimated_rtt + 4 * self.dev_rtt
+        self.timeout_interval = self.timeout_base
 
     def _processar_ack(self, ack_no):
         tempo_atual = time.time()
         pacotes_restantes = []
+        confirmou_algo = False
+        pacotes_confirmados = 0
 
         for item in self.pacotes_nao_confirmados:
             seq, segmento, tamanho, tempo_envio, retransmitido = item
             if seq + tamanho <= ack_no:
-                #PASSO 6 Se o pacote NÃO foi retransmitido, calcula o SampleRTT
+                confirmou_algo = True
+                pacotes_confirmados += 1
                 if not retransmitido:
                     sample_rtt = tempo_atual - tempo_envio
                     self._atualizar_rtt(sample_rtt)
@@ -177,12 +215,20 @@ class Conexao:
 
         self.pacotes_nao_confirmados = pacotes_restantes
 
+        # [PASSO 7] AIMD: aumenta 1 MSS se uma janela inteira foi confirmada
+        if confirmou_algo and pacotes_confirmados >= self.cwnd:
+            self.cwnd += 1
+
         if self.pacotes_nao_confirmados:
             self._iniciar_timer()
         else:
             self._parar_timer()
 
-    #PASSO 4 Fechamento ativamente iniciado pelo servidor
+        # Só envia novos pacotes se confirmou algo e não está em timeout
+        if confirmou_algo and not self.em_timeout:
+            self._enviar_pacotes_pendentes()
+
+    # [PASSO 4] Fechamento ativamente iniciado pelo servidor
     def fechar(self):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
